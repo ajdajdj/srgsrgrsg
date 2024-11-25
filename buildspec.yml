@@ -1,0 +1,43 @@
+version: 0.2
+env:
+  variables:
+    AWS_DEFAULT_REGION: "ap-northeast-2"
+    AWS_ACCOUNT_ID: "471112649369"
+    IMAGE_REPO_NAME: "wsi-ecr"
+phases:
+  pre_build:
+    commands:
+      - ln -sf /usr/share/zoneinfo/Asia/Seoul /etc/localtime
+      - aws ecr get-login-password --region $AWS_DEFAULT_REGION | docker login --username AWS --password-stdin $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com
+      - |
+        echo 'FROM nginx
+        COPY index.html /usr/share/nginx/html/
+        ' > Dockerfile 
+  build:
+    commands:
+      - docker build -t $IMAGE_REPO_NAME .
+      - IMAGE_LATEST_VERSION=$(date +%Y%m%d%H%M%S)
+      - docker tag $IMAGE_REPO_NAME:latest $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/$IMAGE_REPO_NAME:$IMAGE_LATEST_VERSION
+      - docker push $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/$IMAGE_REPO_NAME:$IMAGE_LATEST_VERSION
+  post_build:
+    commands:
+      - IMAGE_LATEST_VERSION=$(echo $(aws ecr describe-images --repository-name $IMAGE_REPO_NAME --query 'sort_by(imageDetails,& imagePushedAt)[-1].imageTags[0]') | tr -d '"')
+      - CONTAINER_NAME="wsi-container"
+      - CONTAINER_PORT="80"
+      - CONTAINER_IMAGE="$AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/$IMAGE_REPO_NAME:${IMAGE_LATEST_VERSION}"
+      - FAMILY="wsi-task"
+      - EXECUTION_ROLE_ARN="arn:aws:iam::$AWS_ACCOUNT_ID:role/ecsTaskExecutionRole"
+      - |
+        jq -n --arg AWS_DEFAULT_REGION $AWS_DEFAULT_REGION --arg FAMILY $FAMILY --arg EXECUTION_ROLE_ARN $EXECUTION_ROLE_ARN --arg CONTAINER_NAME $CONTAINER_NAME --arg CONTAINER_IMAGE $CONTAINER_IMAGE \
+          '{"family":$FAMILY,"executionRoleArn": $EXECUTION_ROLE_ARN, "networkMode": "bridge", "requiresCompatibilities": ["EC2"],"cpu": "512","memory": "1024","runtimePlatform": {"cpuArchitecture": "X86_64", "operatingSystemFamily": "LINUX"},"containerDefinitions": [{"logConfiguration": {"logDriver": "awslogs","options": {"awslogs-group": "/ecs/wsi-task", "awslogs-region": $AWS_DEFAULT_REGION, "awslogs-stream-prefix": "ecs"}},"name": $CONTAINER_NAME,"image": $CONTAINER_IMAGE,"portMappings":[{"containerPort":80,"hostPort":80,"protocol":"tcp"}]}]}' \
+          > task-definition.json
+      - TASK_DEFINITION_JSON=$(aws ecs register-task-definition --cli-input-json file://task-definition.json)
+      - TASK_DEFINITION_ARN=$(echo $TASK_DEFINITION_JSON | jq -r '.taskDefinition .taskDefinitionArn')
+      - >
+        jq -n --arg TASK_DEFINITION_ARN $TASK_DEFINITION_ARN --arg CONTAINER_NAME $CONTAINER_NAME --arg CONTAINER_PORT $CONTAINER_PORT \
+        '{"version": 0.0, "Resources": [{"TargetService": {"Type": "AWS::ECS::Service", "Properties": {"TaskDefinition": $TASK_DEFINITION_ARN, "LoadBalancerInfo": {"ContainerName": $CONTAINER_NAME, "ContainerPort": $CONTAINER_PORT}}}}], "Hooks": []}' \
+        > appspec.json
+artifacts:
+  files:
+    - appspec.json
+  discard-paths: yes
